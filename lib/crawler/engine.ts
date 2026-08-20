@@ -4,6 +4,12 @@ import { db } from "@/lib/db";
 import type { IssueSeverity, IssueType } from "@prisma/client";
 import robotsParser from "robots-parser";
 import { REMEDIATION } from "./remediation";
+import {
+  computeNormalizedHealthScore,
+  countImagesMissingAlt,
+  findIndexableUrlsMissingFromSitemap,
+  groupIndexableMetadataDuplicates,
+} from "./quality";
 
 const ABSOLUTE_MAX_PAGES = 2000;
 const BATCH_SIZE = 15;
@@ -246,9 +252,7 @@ function parseHtml(
   // Images
   const imgTags = [...html.matchAll(/<img\b[^>]*>/gi)].map((m) => m[0]);
   const imageCount = imgTags.length;
-  const imagesMissingAlt = imgTags.filter(
-    (tag) => !/\balt\s*=\s*["'][^"']+["']/i.test(tag)
-  ).length;
+  const imagesMissingAlt = countImagesMissingAlt(imgTags);
 
   // Body text and word count
   const bodyText = stripTags(html);
@@ -579,17 +583,6 @@ function issuesFromPage(page: PageSnapshot, _seedOrigin: string): IssueInput[] {
   return issues;
 }
 
-function computeHealthScore(issues: IssueInput[], pagesFound: number): number {
-  if (pagesFound === 0) return 0;
-  let score = 100;
-  for (const issue of issues) {
-    if (issue.severity === "CRITICAL") score -= 8;
-    else if (issue.severity === "WARNING") score -= 3;
-    else score -= 1;
-  }
-  return Math.max(0, Math.min(100, Math.round(score)));
-}
-
 /* ------------------------------------------------------------------ */
 /*  Main crawl result type                                            */
 /* ------------------------------------------------------------------ */
@@ -844,20 +837,8 @@ async function executeCrawl(
   }
 
   /* ---- Duplicate titles / descriptions ---- */
-  const byTitle = new Map<string, string[]>();
-  const byDesc = new Map<string, string[]>();
-  for (const p of pages) {
-    if (p.title) {
-      const list = byTitle.get(p.title) || [];
-      list.push(p.url);
-      byTitle.set(p.title, list);
-    }
-    if (p.description) {
-      const list = byDesc.get(p.description) || [];
-      list.push(p.url);
-      byDesc.set(p.description, list);
-    }
-  }
+  const byTitle = groupIndexableMetadataDuplicates(pages, "title");
+  const byDesc = groupIndexableMetadataDuplicates(pages, "description");
   for (const [title, urls] of byTitle) {
     if (urls.length > 1) {
       for (const url of urls) {
@@ -894,10 +875,9 @@ async function executeCrawl(
   }
 
   /* ---- Sitemap coverage & orphan detection ---- */
-  const crawledSet = new Set(pages.map((p) => p.url));
-  const sitemapSet = new Set(sitemapUrls);
-  const missingFromSitemap = [...crawledSet].filter(
-    (u) => sitemapSet.size > 0 && !sitemapSet.has(u)
+  const missingFromSitemap = findIndexableUrlsMissingFromSitemap(
+    pages,
+    sitemapUrls
   );
 
   const inlinkCount = new Map<string, number>();
@@ -935,7 +915,10 @@ async function executeCrawl(
   }
 
   /* ---- Compute scores ---- */
-  const healthScore = computeHealthScore(issues, pages.length);
+  const healthScore = computeNormalizedHealthScore(
+    issues.map((issue) => issue.severity),
+    pages.length
+  );
   const avgContentScore =
     pages.length > 0
       ? Math.round(
@@ -1013,55 +996,6 @@ async function executeCrawl(
       })),
     });
   }
-
-  // Thin content pages as INFO issues
-  const thin = pages.filter((p) => p.contentScore < 60);
-  if (thin.length) {
-    await db.crawlIssue.createMany({
-      data: thin.slice(0, 50).map((p) => ({
-        crawlId,
-        url: p.url,
-        type: "MISSING_DESCRIPTION" as IssueType,
-        severity: "INFO" as IssueSeverity,
-        message: `On-page content score ${p.contentScore}/100 (${p.wordCount} words)`,
-        details: {
-          kind: "content_score",
-          contentScore: p.contentScore,
-          wordCount: p.wordCount,
-          title: p.title,
-          h1Count: p.h1s.length,
-        },
-      })),
-    });
-  }
-
-  // Crawl summary issue
-  await db.crawlIssue.create({
-    data: {
-      crawlId,
-      url: seedUrl,
-      type: "MISSING_SCHEMA",
-      severity: "INFO",
-      message: "Crawl summary",
-      details: {
-        kind: "crawl_summary",
-        pages: pages.map((p) => ({
-          url: p.url,
-          statusCode: p.statusCode,
-          title: p.title,
-          contentScore: p.contentScore,
-          wordCount: p.wordCount,
-          outlinks: p.internalOutlinks.length,
-          externalOutlinks: p.externalOutlinks.length,
-          inlinks: inlinkCount.get(p.url) || 0,
-        })),
-        sitemapUrls: sitemapUrls.length,
-        missingFromSitemap: missingFromSitemap.length,
-        orphans: orphans.length,
-        avgContentScore,
-      },
-    },
-  });
 
   /* ---- Finalize crawl record ---- */
   const finalIssues = await db.crawlIssue.count({

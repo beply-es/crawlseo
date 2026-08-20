@@ -23,6 +23,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test --experimental-strip-types lib/**/*.test.mts",
     "lint": "eslint",
     "mcp": "npx tsx mcp/server.ts",
     "seed:demo": "npx tsx scripts/seed-demo.ts",
